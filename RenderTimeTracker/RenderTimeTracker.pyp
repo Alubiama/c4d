@@ -1,18 +1,19 @@
 """
-Render Time Tracker - Cinema 4D Plugin
+Render Time Tracker v2 - Cinema 4D Plugin
 
-Tracks render queue (Batch Render) job durations.
-Shows per-job timing and total render time for the session.
-Supports JSON report export.
+Tracks render queue (Batch Render) job durations with persistent logging.
+Groups scenes by project (parent folder). Survives crashes and restarts.
+Monthly log rotation with cleanup.
+
+Log format (append-only, one event per line):
+    2025-01-15T03:12:05|START|D:/Projects/ClientX/scene_01.c4d
+    2025-01-15T03:45:18|FINISH|D:/Projects/ClientX/scene_01.c4d|1993.2
+    2025-01-15T03:45:19|FAIL|D:/Projects/ClientX/scene_02.c4d|504.0
+    2025-01-15T03:45:19|STOP|D:/Projects/ClientX/scene_03.c4d|120.5
 
 Installation:
-    Copy the 'RenderTimeTracker' folder into your Cinema 4D plugins directory:
-        Windows: C:\\Program Files\\Maxon Cinema 4D <version>\\plugins\\
-        macOS:   /Applications/Maxon Cinema 4D <version>/plugins/
-    Restart Cinema 4D.
-
-Usage:
-    Extensions > Render Time Tracker
+    Copy the 'RenderTimeTracker' folder into Cinema 4D's plugins directory.
+    Restart Cinema 4D.  Menu: Extensions > Render Time Tracker
 """
 
 import c4d
@@ -25,23 +26,26 @@ import json
 # =============================================================================
 # Plugin IDs - register your own at https://plugincafe.maxon.net/pluginids
 # =============================================================================
-PLUGIN_ID_MSG = 1060510   # MessageData (background monitor)
-PLUGIN_ID_CMD = 1060511   # CommandData (menu entry / dialog)
+PLUGIN_ID_MSG = 1060510
+PLUGIN_ID_CMD = 1060511
 
 # =============================================================================
 # Settings
 # =============================================================================
-POLL_MS = 2000  # Render queue poll interval in milliseconds
+POLL_MS = 2000           # Timer interval (ms) for MessageData and Dialog
+THROTTLE_SEC = 1.5       # Min seconds between actual queue polls
 
 # =============================================================================
 # Dialog widget IDs
 # =============================================================================
-ID_GRP_JOBS     = 10000
-ID_LBL_TOTAL    = 10001
-ID_LBL_COUNT    = 10002
-ID_BTN_CLEAR    = 10003
-ID_BTN_EXPORT   = 10004
-ID_BTN_REFRESH  = 10005
+ID_GRP_JOBS      = 10000
+ID_LBL_TOTAL     = 10001
+ID_LBL_COUNT     = 10002
+ID_BTN_CLEANUP   = 10003
+ID_BTN_EXPORT    = 10004
+ID_BTN_REFRESH   = 10005
+ID_CMB_MONTH     = 10006
+ID_CMB_CLEANUP   = 10007
 
 
 # =============================================================================
@@ -50,7 +54,7 @@ ID_BTN_REFRESH  = 10005
 
 def fmt_duration(seconds):
     """Format seconds as HH:MM:SS."""
-    if seconds < 0:
+    if not seconds or seconds < 0:
         seconds = 0
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -58,221 +62,16 @@ def fmt_duration(seconds):
     return "{:02d}:{:02d}:{:02d}".format(h, m, s)
 
 
-def fmt_time(timestamp):
-    """Format a unix timestamp as HH:MM:SS."""
-    if timestamp is None:
-        return ""
-    return datetime.datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+def extract_project(filepath):
+    """Extract project name from scene file path.
 
-
-def fmt_date(timestamp):
-    """Format a unix timestamp as YYYY-MM-DD HH:MM:SS."""
-    if timestamp is None:
-        return ""
-    return datetime.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def scene_name_from_path(path):
-    """Extract a readable scene name from a file path."""
-    if not path:
-        return "Unknown"
-    name = os.path.basename(str(path))
+    Uses the parent directory name as the project identifier.
+    E.g. 'D:/Projects/ClientX/scenes/shot01.c4d' -> 'scenes'
+         'D:/Projects/ClientX/shot01.c4d'         -> 'ClientX'
+    """
+    parent = os.path.dirname(str(filepath))
+    name = os.path.basename(parent)
     return name if name else "Unknown"
-
-
-# Status code to human-readable label mapping.
-# Cinema 4D constants: RM_PROGRESS, RM_FINISHED, RM_FAILED, RM_STOPPED, etc.
-STATUS_LABELS = {}
-
-def _init_status_labels():
-    """Build status label map from available c4d constants."""
-    mapping = {
-        "RM_PROGRESS":    "Rendering",
-        "RM_FINISHED":    "Finished",
-        "RM_FAILED":      "Failed",
-        "RM_STOPPED":     "Stopped",
-        "RM_DEACTIVATED": "Deactivated",
-        "RM_WAITING":     "Waiting",
-    }
-    for attr, label in mapping.items():
-        val = getattr(c4d, attr, None)
-        if val is not None:
-            STATUS_LABELS[val] = label
-
-_init_status_labels()
-
-
-def status_label(rm_status):
-    return STATUS_LABELS.get(rm_status, "Unknown ({})".format(rm_status))
-
-
-# =============================================================================
-# Data model
-# =============================================================================
-
-class RenderJob(object):
-    """Stores timing data for a single render queue job."""
-
-    def __init__(self, queue_index, name):
-        self.queue_index = queue_index
-        self.name = name
-        self.start_time = None   # unix timestamp
-        self.end_time = None     # unix timestamp
-        self.status = "Waiting"
-
-    @property
-    def duration(self):
-        if self.start_time is None:
-            return 0.0
-        end = self.end_time if self.end_time else time.time()
-        return max(0.0, end - self.start_time)
-
-    @property
-    def duration_str(self):
-        return fmt_duration(self.duration)
-
-    @property
-    def is_active(self):
-        return self.status == "Rendering"
-
-    def to_dict(self):
-        return {
-            "name": self.name,
-            "status": self.status,
-            "start": fmt_date(self.start_time),
-            "end": fmt_date(self.end_time),
-            "duration_seconds": round(self.duration, 2),
-            "duration_formatted": self.duration_str,
-        }
-
-
-# =============================================================================
-# Tracker engine
-# =============================================================================
-
-class RenderTimeTracker(object):
-    """Polls the Cinema 4D Batch Render queue and tracks job durations."""
-
-    def __init__(self):
-        self.jobs = []
-        self._prev = {}       # queue_index -> (rm_status, name)
-        self._changed = True  # flag: UI needs refresh
-
-    # -- public API -----------------------------------------------------------
-
-    def clear(self):
-        """Clear all tracked jobs."""
-        self.jobs = []
-        self._prev = {}
-        self._changed = True
-        _log("Log cleared")
-
-    @property
-    def total_duration(self):
-        return sum(j.duration for j in self.jobs if j.start_time)
-
-    @property
-    def total_duration_str(self):
-        return fmt_duration(self.total_duration)
-
-    @property
-    def completed_count(self):
-        return sum(1 for j in self.jobs if j.status in ("Finished", "Completed"))
-
-    @property
-    def has_active(self):
-        return any(j.is_active for j in self.jobs)
-
-    def needs_refresh(self):
-        """Return True and reset flag if the UI should refresh."""
-        if self._changed:
-            self._changed = False
-            return True
-        return False
-
-    def poll(self):
-        """Check render queue; detect status changes and update jobs."""
-        br = c4d.documents.GetBatchRender()
-        if br is None:
-            return
-
-        count = br.GetElementCount()
-        for i in range(count):
-            rm_status = br.GetElementStatus(i)
-            path = br.GetElement(i)
-            name = scene_name_from_path(path)
-
-            job = self._get_or_create(i, name)
-            prev_entry = self._prev.get(i)
-            prev_rm = prev_entry[0] if prev_entry else None
-
-            if rm_status != prev_rm:
-                self._on_transition(job, prev_rm, rm_status)
-                self._prev[i] = (rm_status, name)
-                self._changed = True
-
-    def export_json(self, filepath):
-        """Write a JSON report to *filepath*."""
-        report = {
-            "exported_at": datetime.datetime.now().isoformat(),
-            "total_duration_seconds": round(self.total_duration, 2),
-            "total_duration_formatted": self.total_duration_str,
-            "job_count": len(self.jobs),
-            "completed_count": self.completed_count,
-            "jobs": [j.to_dict() for j in self.jobs],
-        }
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-
-    # -- internals ------------------------------------------------------------
-
-    def _get_or_create(self, index, name):
-        for j in self.jobs:
-            if j.queue_index == index:
-                if j.name != name:
-                    j.name = name
-                return j
-        job = RenderJob(index, name)
-        self.jobs.append(job)
-        return job
-
-    def _on_transition(self, job, old_rm, new_rm):
-        progress = getattr(c4d, "RM_PROGRESS", None)
-        finished = getattr(c4d, "RM_FINISHED", None)
-        failed   = getattr(c4d, "RM_FAILED", None)
-        stopped  = getattr(c4d, "RM_STOPPED", None)
-
-        if new_rm == progress:
-            # Render started
-            job.start_time = time.time()
-            job.end_time = None
-            job.status = "Rendering"
-            _log("Started: {}".format(job.name))
-            c4d.StatusSetText("[RenderTimer] Started: {}".format(job.name))
-
-        elif new_rm == finished:
-            if old_rm == progress and job.start_time:
-                job.end_time = time.time()
-                job.status = "Completed"
-                _log("Completed: {} ({})".format(job.name, job.duration_str))
-                c4d.StatusSetText(
-                    "[RenderTimer] {} done - {}".format(job.name, job.duration_str))
-            else:
-                job.status = "Finished"
-
-        elif new_rm == failed:
-            if old_rm == progress and job.start_time:
-                job.end_time = time.time()
-            job.status = "Failed"
-            _log("Failed: {}".format(job.name))
-            c4d.StatusSetText("[RenderTimer] Failed: {}".format(job.name))
-
-        elif new_rm == stopped:
-            if old_rm == progress and job.start_time:
-                job.end_time = time.time()
-            job.status = "Stopped"
-            _log("Stopped: {}".format(job.name))
-            c4d.StatusSetText("[RenderTimer] Stopped: {}".format(job.name))
 
 
 def _log(msg):
@@ -282,17 +81,366 @@ def _log(msg):
 
 
 # =============================================================================
+# Persistent log  (append-only, monthly rotation, crash-safe)
+# =============================================================================
+
+class RenderLog(object):
+    """Append-only log writer/reader with monthly file rotation.
+
+    Each event is a single line written atomically with flush + fsync.
+    If the machine loses power mid-write, at most one line is lost.
+    """
+
+    def __init__(self, log_dir):
+        self.log_dir = log_dir
+        self._ensure_dir()
+
+    # -- writing --------------------------------------------------------------
+
+    def write_event(self, event, filepath, duration=None):
+        """Append one event line and force it to disk."""
+        ts = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        parts = [ts, event, str(filepath)]
+        if duration is not None:
+            parts.append("{:.1f}".format(duration))
+        line = "|".join(parts) + "\n"
+
+        self._ensure_dir()
+        log_path = self._month_path()
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            _log("WARNING: Failed to write log: {}".format(e))
+
+    # -- reading --------------------------------------------------------------
+
+    def read_entries(self, months=None):
+        """Read and parse log entries. *months*: list of 'YYYY-MM' or None for all."""
+        entries = []
+        for date_str, fpath in self._list_files():
+            if months is not None and date_str not in months:
+                continue
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for line_raw in f:
+                        entry = self._parse_line(line_raw.strip())
+                        if entry:
+                            entries.append(entry)
+            except Exception:
+                continue
+        return entries
+
+    def available_months(self):
+        """Return sorted list of 'YYYY-MM' strings for which log files exist."""
+        return [ds for ds, _ in self._list_files()]
+
+    # -- cleanup --------------------------------------------------------------
+
+    def delete_before(self, cutoff_ym):
+        """Delete log files older than *cutoff_ym* ('YYYY-MM'). Returns count."""
+        deleted = 0
+        for ds, fpath in self._list_files():
+            if ds < cutoff_ym:
+                try:
+                    os.remove(fpath)
+                    deleted += 1
+                except Exception:
+                    pass
+        return deleted
+
+    # -- internals ------------------------------------------------------------
+
+    def _ensure_dir(self):
+        if not os.path.isdir(self.log_dir):
+            try:
+                os.makedirs(self.log_dir)
+            except OSError:
+                pass
+
+    def _month_path(self, dt=None):
+        if dt is None:
+            dt = datetime.datetime.now()
+        name = "render_log_{}.log".format(dt.strftime("%Y-%m"))
+        return os.path.join(self.log_dir, name)
+
+    def _list_files(self):
+        """Return sorted list of (date_str, filepath) for all log files."""
+        result = []
+        if not os.path.isdir(self.log_dir):
+            return result
+        for name in sorted(os.listdir(self.log_dir)):
+            if name.startswith("render_log_") and name.endswith(".log"):
+                date_str = name[len("render_log_"):-len(".log")]
+                result.append((date_str, os.path.join(self.log_dir, name)))
+        return result
+
+    def _parse_line(self, line):
+        """Parse a single log line. Returns dict or None on failure."""
+        if not line:
+            return None
+        parts = line.split("|")
+        if len(parts) < 3:
+            return None
+        try:
+            return {
+                "time": datetime.datetime.strptime(parts[0], "%Y-%m-%dT%H:%M:%S"),
+                "event": parts[1],
+                "path": parts[2],
+                "duration": float(parts[3]) if len(parts) > 3 else None,
+            }
+        except (ValueError, IndexError):
+            return None  # corrupted line, skip
+
+
+# =============================================================================
+# Tracker engine
+# =============================================================================
+
+class RenderTimeTracker(object):
+    """Monitors the Batch Render queue and writes events to the persistent log.
+
+    Uses file path (not queue index) as the stable job identifier.
+    Detects transitions: Waiting -> Rendering -> Completed/Failed/Stopped.
+    Tracks active renders in memory; everything else lives on disk.
+    """
+
+    def __init__(self, log):
+        self.log = log                  # RenderLog instance
+        self._prev = {}                 # queue_index -> (rm_status, path)
+        self._active = {}               # queue_index -> (start_time, path)
+        self._last_poll_time = 0.0
+        self._changed = True
+        self._cache = None              # (months_key, jobs_list)
+
+    # -- public API -----------------------------------------------------------
+
+    @property
+    def has_active(self):
+        return len(self._active) > 0
+
+    def needs_refresh(self):
+        if self._changed:
+            self._changed = False
+            return True
+        return False
+
+    def invalidate_cache(self):
+        self._cache = None
+        self._changed = True
+
+    def poll(self):
+        """Check the render queue for status changes. Throttled."""
+        now = time.time()
+        if now - self._last_poll_time < THROTTLE_SEC:
+            return
+        self._last_poll_time = now
+
+        br = c4d.documents.GetBatchRender()
+        if br is None:
+            return
+
+        count = br.GetElementCount()
+        current = {}
+
+        for i in range(count):
+            rm_status = br.GetElementStatus(i)
+            path = str(br.GetElement(i) or "")
+            current[i] = (rm_status, path)
+
+        # Detect transitions at each index
+        for i, (rm_status, path) in current.items():
+            prev = self._prev.get(i)
+            prev_status = prev[0] if prev else None
+            prev_path = prev[1] if prev else None
+
+            # Path changed at this index -> old job was removed/replaced
+            if prev_path and prev_path != path and i in self._active:
+                self._finish_active(i, "STOP")
+
+            if rm_status != prev_status or (prev_path and prev_path != path):
+                self._on_transition(i, path, prev_status, rm_status)
+
+        # Indices that disappeared (queue got shorter or items removed)
+        for i in list(self._prev.keys()):
+            if i not in current and i in self._active:
+                self._finish_active(i, "STOP")
+
+        self._prev = current
+
+    def stop_all_active(self):
+        """Write STOP for every currently active render. Called on C4D shutdown."""
+        for i in list(self._active.keys()):
+            self._finish_active(i, "STOP")
+
+    def get_display_data(self, months=None):
+        """Build display data from log + active renders.
+
+        Returns (projects_dict, all_jobs_list) where:
+            projects_dict = { "ProjectName": {"jobs": [...], "total": float}, ... }
+            all_jobs_list = flat list of all job dicts
+        """
+        months_key = tuple(months) if months else None
+
+        # Use cached historical data if available
+        if self._cache and self._cache[0] == months_key:
+            historical = self._cache[1]
+        else:
+            historical = self._build_jobs_from_log(months)
+            self._cache = (months_key, historical)
+
+        # Merge with currently active renders
+        all_jobs = list(historical)
+        for _idx, (start_time, path) in self._active.items():
+            all_jobs.append({
+                "path": path,
+                "name": os.path.basename(path),
+                "project": extract_project(path),
+                "start": datetime.datetime.fromtimestamp(start_time),
+                "end": None,
+                "duration": time.time() - start_time,
+                "status": "Rendering",
+            })
+
+        # Group by project
+        projects = {}
+        for job in all_jobs:
+            pname = job["project"]
+            if pname not in projects:
+                projects[pname] = {"jobs": [], "total": 0.0}
+            projects[pname]["jobs"].append(job)
+            projects[pname]["total"] += job["duration"]
+
+        return projects, all_jobs
+
+    # -- internals ------------------------------------------------------------
+
+    def _on_transition(self, index, path, old_rm, new_rm):
+        progress = getattr(c4d, "RM_PROGRESS", None)
+        finished = getattr(c4d, "RM_FINISHED", None)
+        failed = getattr(c4d, "RM_FAILED", None)
+        stopped = getattr(c4d, "RM_STOPPED", None)
+
+        name = os.path.basename(path)
+
+        if new_rm == progress and old_rm != progress:
+            # Render started
+            self._active[index] = (time.time(), path)
+            self.log.write_event("START", path)
+            self._changed = True
+            self._cache = None
+            _log("Started: {}".format(name))
+            c4d.StatusSetText("[RenderTimer] Started: {}".format(name))
+
+        elif new_rm == finished and old_rm == progress:
+            self._finish_active(index, "FINISH")
+
+        elif new_rm == failed and old_rm == progress:
+            self._finish_active(index, "FAIL")
+
+        elif new_rm == stopped and old_rm == progress:
+            self._finish_active(index, "STOP")
+
+    def _finish_active(self, index, event):
+        """Complete an active render: calculate duration, write to log."""
+        info = self._active.pop(index, None)
+        if info is None:
+            return
+        start_time, path = info
+        duration = max(0.0, time.time() - start_time)
+        self.log.write_event(event, path, duration)
+        self._changed = True
+        self._cache = None
+
+        name = os.path.basename(path)
+        dur_str = fmt_duration(duration)
+        if event == "FINISH":
+            _log("Completed: {} ({})".format(name, dur_str))
+            c4d.StatusSetText(
+                "[RenderTimer] {} done - {}".format(name, dur_str))
+        elif event == "FAIL":
+            _log("Failed: {} ({})".format(name, dur_str))
+            c4d.StatusSetText("[RenderTimer] Failed: {}".format(name))
+        elif event == "STOP":
+            _log("Stopped: {} ({})".format(name, dur_str))
+
+    def _build_jobs_from_log(self, months=None):
+        """Parse log entries into a list of job dicts.
+
+        Matches each START with its next FINISH/FAIL/STOP for the same path
+        (FIFO order). Unmatched STARTs become 'Interrupted'.
+        """
+        entries = self.log.read_entries(months)
+        jobs = []
+        pending = {}  # path -> [entry, ...] (FIFO queue per path)
+
+        for e in entries:
+            path = e["path"]
+            if e["event"] == "START":
+                pending.setdefault(path, []).append(e)
+
+            elif e["event"] in ("FINISH", "FAIL", "STOP"):
+                start_entry = None
+                if path in pending and pending[path]:
+                    start_entry = pending[path].pop(0)
+                    if not pending[path]:
+                        del pending[path]
+
+                status_map = {
+                    "FINISH": "Completed",
+                    "FAIL": "Failed",
+                    "STOP": "Stopped",
+                }
+                jobs.append({
+                    "path": path,
+                    "name": os.path.basename(path),
+                    "project": extract_project(path),
+                    "start": start_entry["time"] if start_entry else e["time"],
+                    "end": e["time"],
+                    "duration": e["duration"] or 0.0,
+                    "status": status_map.get(e["event"], "Unknown"),
+                })
+
+        # Unmatched STARTs = renders interrupted by crash / power loss
+        for path, starts in pending.items():
+            for s in starts:
+                jobs.append({
+                    "path": path,
+                    "name": os.path.basename(path),
+                    "project": extract_project(path),
+                    "start": s["time"],
+                    "end": None,
+                    "duration": 0.0,
+                    "status": "Interrupted",
+                })
+
+        return jobs
+
+
+# =============================================================================
 # Global instances
 # =============================================================================
 
-_tracker = None   # RenderTimeTracker
-_dialog = None    # RenderTimeDialog
+_log_instance = None
+_tracker = None
+_dialog = None
+
+
+def get_log():
+    global _log_instance
+    if _log_instance is None:
+        prefs = c4d.storage.GeGetC4DPath(c4d.C4D_PATH_PREFS)
+        log_dir = os.path.join(prefs, "RenderTimeTracker")
+        _log_instance = RenderLog(log_dir)
+    return _log_instance
 
 
 def get_tracker():
     global _tracker
     if _tracker is None:
-        _tracker = RenderTimeTracker()
+        _tracker = RenderTimeTracker(get_log())
     return _tracker
 
 
@@ -301,27 +449,35 @@ def get_tracker():
 # =============================================================================
 
 class RenderTimeDialog(gui.GeDialog):
-    """Non-modal dialog showing render time statistics."""
+    """Non-modal dialog showing render time statistics grouped by project."""
 
     def CreateLayout(self):
         self.SetTitle("Render Time Tracker")
 
-        # Main container
         self.GroupBegin(0, c4d.BFH_SCALEFIT | c4d.BFV_SCALEFIT, 1, 0, "")
         self.GroupBorderSpace(10, 10, 10, 10)
 
-        # Column headers
+        # -- Filter bar -------------------------------------------------------
+        self.GroupBegin(0, c4d.BFH_SCALEFIT, 3, 0, "")
+        self.AddStaticText(0, c4d.BFH_LEFT, 0, 0, "Month:")
+        self.AddComboBox(ID_CMB_MONTH, c4d.BFH_LEFT, 130, 0)
+        self.AddButton(ID_BTN_REFRESH, c4d.BFH_LEFT, 80, 0, "Refresh")
+        self.GroupEnd()
+
+        self.AddSeparatorH(0, c4d.BFH_SCALEFIT)
+
+        # -- Column headers ---------------------------------------------------
         self.GroupBegin(0, c4d.BFH_SCALEFIT, 5, 0, "")
         self.AddStaticText(0, c4d.BFH_LEFT,     30,  13, "#")
         self.AddStaticText(0, c4d.BFH_SCALEFIT,  0,  13, "Scene")
-        self.AddStaticText(0, c4d.BFH_LEFT,     80,  13, "Status")
-        self.AddStaticText(0, c4d.BFH_LEFT,     70,  13, "Start")
+        self.AddStaticText(0, c4d.BFH_LEFT,     85,  13, "Status")
+        self.AddStaticText(0, c4d.BFH_LEFT,    105,  13, "Start")
         self.AddStaticText(0, c4d.BFH_LEFT,     80,  13, "Duration")
         self.GroupEnd()
 
         self.AddSeparatorH(0, c4d.BFH_SCALEFIT)
 
-        # Scrollable job list
+        # -- Scrollable job list ----------------------------------------------
         self.ScrollGroupBegin(0,
                               c4d.BFH_SCALEFIT | c4d.BFV_SCALEFIT,
                               c4d.SCROLLGROUP_VERT | c4d.SCROLLGROUP_AUTOVERT)
@@ -332,98 +488,203 @@ class RenderTimeDialog(gui.GeDialog):
 
         self.AddSeparatorH(0, c4d.BFH_SCALEFIT)
 
-        # Summary row
+        # -- Summary ----------------------------------------------------------
         self.GroupBegin(0, c4d.BFH_SCALEFIT, 4, 0, "")
         self.AddStaticText(0,            c4d.BFH_LEFT, 0, 0, "Jobs:")
-        self.AddStaticText(ID_LBL_COUNT, c4d.BFH_LEFT, 60, 0, "0")
-        self.AddStaticText(0,            c4d.BFH_LEFT, 0, 0, "Total time:")
+        self.AddStaticText(ID_LBL_COUNT, c4d.BFH_LEFT, 80, 0, "0")
+        self.AddStaticText(0,            c4d.BFH_LEFT, 0, 0, "Total:")
         self.AddStaticText(ID_LBL_TOTAL, c4d.BFH_LEFT, 100, 0, "00:00:00")
         self.GroupEnd()
 
         self.AddSeparatorH(0, c4d.BFH_SCALEFIT)
 
-        # Buttons
-        self.GroupBegin(0, c4d.BFH_SCALEFIT, 3, 0, "")
-        self.AddButton(ID_BTN_REFRESH, c4d.BFH_LEFT, 90, 0, "Refresh")
-        self.AddButton(ID_BTN_EXPORT,  c4d.BFH_LEFT, 90, 0, "Export JSON")
-        self.AddButton(ID_BTN_CLEAR,   c4d.BFH_LEFT, 90, 0, "Clear Log")
+        # -- Buttons ----------------------------------------------------------
+        self.GroupBegin(0, c4d.BFH_SCALEFIT, 4, 0, "")
+        self.AddButton(ID_BTN_EXPORT, c4d.BFH_LEFT, 110, 0, "Export JSON")
+        self.AddStaticText(0, c4d.BFH_LEFT, 20, 0, "")
+        self.AddComboBox(ID_CMB_CLEANUP, c4d.BFH_LEFT, 160, 0)
+        self.AddButton(ID_BTN_CLEANUP, c4d.BFH_LEFT, 110, 0, "Clean Up")
         self.GroupEnd()
 
-        self.GroupEnd()  # main container
+        self.GroupEnd()  # main
         return True
 
     def InitValues(self):
+        self._fill_month_combo()
+        self._fill_cleanup_combo()
         self._rebuild()
         return True
 
     def Timer(self, msg):
-        """Called periodically when SetTimer is active."""
         tracker = get_tracker()
         tracker.poll()
-        # Refresh if data changed or if jobs are actively rendering
-        # (so the duration counters keep ticking)
         if tracker.needs_refresh() or tracker.has_active:
             self._rebuild()
 
     def Command(self, id, msg):
-        if id == ID_BTN_CLEAR:
-            get_tracker().clear()
+        if id == ID_BTN_REFRESH:
+            get_tracker().invalidate_cache()
+            self._fill_month_combo()
+            self._rebuild()
+
+        elif id == ID_CMB_MONTH:
+            get_tracker().invalidate_cache()
             self._rebuild()
 
         elif id == ID_BTN_EXPORT:
-            self._export()
+            self._do_export()
 
-        elif id == ID_BTN_REFRESH:
-            get_tracker().poll()
-            self._rebuild()
+        elif id == ID_BTN_CLEANUP:
+            self._do_cleanup()
 
         return True
 
-    # -- display --------------------------------------------------------------
+    # -- helpers --------------------------------------------------------------
+
+    def _selected_months(self):
+        """Return list of 'YYYY-MM' from the filter combo, or None for all."""
+        val = self.GetInt32(ID_CMB_MONTH)
+        if val == 0:
+            return None
+        months = get_log().available_months()
+        idx = val - 1
+        if 0 <= idx < len(months):
+            return [months[idx]]
+        return None
+
+    def _fill_month_combo(self):
+        self.FreeChildren(ID_CMB_MONTH)
+        self.AddChild(ID_CMB_MONTH, 0, "All months")
+        for i, ym in enumerate(get_log().available_months()):
+            self.AddChild(ID_CMB_MONTH, i + 1, ym)
+        self.SetInt32(ID_CMB_MONTH, 0)
+
+    def _fill_cleanup_combo(self):
+        self.FreeChildren(ID_CMB_CLEANUP)
+        self.AddChild(ID_CMB_CLEANUP, 1, "Older than 1 month")
+        self.AddChild(ID_CMB_CLEANUP, 3, "Older than 3 months")
+        self.AddChild(ID_CMB_CLEANUP, 6, "Older than 6 months")
+        self.AddChild(ID_CMB_CLEANUP, 12, "Older than 1 year")
+        self.SetInt32(ID_CMB_CLEANUP, 3)
 
     def _rebuild(self):
-        """Rebuild the job list group."""
+        """Rebuild the job list grouped by project."""
         tracker = get_tracker()
+        months = self._selected_months()
+        projects, all_jobs = tracker.get_display_data(months)
 
         self.LayoutFlushGroup(ID_GRP_JOBS)
 
-        if not tracker.jobs:
+        if not all_jobs:
             self.AddStaticText(0, c4d.BFH_SCALEFIT, 0, 0,
-                               "No render jobs tracked yet. "
-                               "Add scenes to the Render Queue and start rendering.")
+                               "No render jobs recorded yet.")
         else:
-            for idx, job in enumerate(tracker.jobs):
-                self.GroupBegin(0, c4d.BFH_SCALEFIT, 5, 0, "")
-                self.AddStaticText(0, c4d.BFH_LEFT,     30, 0, str(idx + 1))
-                self.AddStaticText(0, c4d.BFH_SCALEFIT,  0, 0, job.name)
-                self.AddStaticText(0, c4d.BFH_LEFT,     80, 0, job.status)
-                self.AddStaticText(0, c4d.BFH_LEFT,     70, 0,
-                                   fmt_time(job.start_time))
-                self.AddStaticText(0, c4d.BFH_LEFT,     80, 0, job.duration_str)
+            counter = 0
+            for proj_name in sorted(projects.keys()):
+                proj = projects[proj_name]
+
+                # Project header
+                self.GroupBegin(0, c4d.BFH_SCALEFIT, 2, 0, "")
+                self.AddStaticText(
+                    0, c4d.BFH_SCALEFIT, 0, 15,
+                    "--- {} ---".format(proj_name))
+                self.AddStaticText(
+                    0, c4d.BFH_LEFT, 80, 15,
+                    fmt_duration(proj["total"]))
                 self.GroupEnd()
+
+                # Scenes in this project
+                for job in proj["jobs"]:
+                    counter += 1
+                    self.GroupBegin(0, c4d.BFH_SCALEFIT, 5, 0, "")
+
+                    self.AddStaticText(
+                        0, c4d.BFH_LEFT, 30, 0, str(counter))
+                    self.AddStaticText(
+                        0, c4d.BFH_SCALEFIT, 0, 0, job["name"])
+                    self.AddStaticText(
+                        0, c4d.BFH_LEFT, 85, 0, job["status"])
+
+                    start_str = ""
+                    if job["start"]:
+                        start_str = job["start"].strftime("%m-%d %H:%M")
+                    self.AddStaticText(
+                        0, c4d.BFH_LEFT, 105, 0, start_str)
+
+                    self.AddStaticText(
+                        0, c4d.BFH_LEFT, 80, 0, fmt_duration(job["duration"]))
+
+                    self.GroupEnd()
 
         self.LayoutChanged(ID_GRP_JOBS)
 
-        # Update summary
-        self.SetString(ID_LBL_TOTAL,
-                       tracker.total_duration_str)
+        # Summary
+        total_dur = sum(j["duration"] for j in all_jobs)
+        completed = sum(1 for j in all_jobs if j["status"] == "Completed")
+        self.SetString(ID_LBL_TOTAL, fmt_duration(total_dur))
         self.SetString(ID_LBL_COUNT,
-                       "{} / {}".format(tracker.completed_count, len(tracker.jobs)))
+                       "{} / {}".format(completed, len(all_jobs)))
 
-    def _export(self):
+    def _do_export(self):
         path = storage.SaveDialog(
             c4d.FILESELECTTYPE_ANYTHING,
-            "Save Render Time Report",
-            "json")
+            "Save Render Time Report", "json")
         if not path:
             return
         if not path.lower().endswith(".json"):
             path += ".json"
+
+        tracker = get_tracker()
+        months = self._selected_months()
+        projects, all_jobs = tracker.get_display_data(months)
+
+        total_dur = sum(j["duration"] for j in all_jobs)
+        report = {
+            "exported_at": datetime.datetime.now().isoformat(),
+            "total_duration_seconds": round(total_dur, 2),
+            "total_duration": fmt_duration(total_dur),
+            "projects": {},
+        }
+        for pname in sorted(projects.keys()):
+            pdata = projects[pname]
+            report["projects"][pname] = {
+                "total_seconds": round(pdata["total"], 2),
+                "total": fmt_duration(pdata["total"]),
+                "scenes": [{
+                    "name": j["name"],
+                    "path": j["path"],
+                    "status": j["status"],
+                    "start": j["start"].isoformat() if j["start"] else None,
+                    "end": j["end"].isoformat() if j["end"] else None,
+                    "duration_seconds": round(j["duration"], 2),
+                    "duration": fmt_duration(j["duration"]),
+                } for j in pdata["jobs"]],
+            }
+
         try:
-            get_tracker().export_json(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
             gui.MessageDialog("Report saved:\n{}".format(path))
         except Exception as e:
             gui.MessageDialog("Export failed:\n{}".format(e))
+
+    def _do_cleanup(self):
+        months_back = self.GetInt32(ID_CMB_CLEANUP)
+        if not months_back:
+            months_back = 3
+        cutoff_dt = datetime.datetime.now() - datetime.timedelta(days=months_back * 30)
+        cutoff_ym = cutoff_dt.strftime("%Y-%m")
+
+        count = get_log().delete_before(cutoff_ym)
+        get_tracker().invalidate_cache()
+        self._fill_month_combo()
+        self._rebuild()
+
+        if count > 0:
+            gui.MessageDialog(
+                "Deleted {} log file(s) older than {}.".format(count, cutoff_ym))
+        else:
+            gui.MessageDialog("No log files to clean up.")
 
 
 # =============================================================================
@@ -431,7 +692,6 @@ class RenderTimeDialog(gui.GeDialog):
 # =============================================================================
 
 class RenderTimeTrackerCmd(plugins.CommandData):
-    """Opens / closes the Render Time Tracker dialog."""
 
     def Execute(self, doc):
         global _dialog
@@ -444,14 +704,13 @@ class RenderTimeTrackerCmd(plugins.CommandData):
             _dialog.Open(
                 dlgtype=c4d.DLG_TYPE_ASYNC,
                 pluginid=PLUGIN_ID_CMD,
-                defaultw=600,
-                defaulth=350,
+                defaultw=650,
+                defaulth=400,
             )
             _dialog.SetTimer(POLL_MS)
         return True
 
     def RestoreLayout(self, sec_ref):
-        """Restore dialog when Cinema 4D reloads its layout."""
         global _dialog
         if _dialog is None:
             _dialog = RenderTimeDialog()
@@ -467,7 +726,6 @@ class RenderTimeTrackerCmd(plugins.CommandData):
 # =============================================================================
 
 class RenderTimerMsg(plugins.MessageData):
-    """Polls the render queue in the background."""
 
     def GetTimer(self):
         return POLL_MS
@@ -478,14 +736,26 @@ class RenderTimerMsg(plugins.MessageData):
 
 
 # =============================================================================
-# Plugin registration
+# Lifecycle: handle Cinema 4D shutdown gracefully
+# =============================================================================
+
+def PluginMessage(id, data):
+    if id == c4d.C4DPL_ENDACTIVITY:
+        # Cinema 4D is shutting down - save any active renders as STOP
+        tracker = get_tracker()
+        if tracker.has_active:
+            _log("C4D shutting down, stopping active render tracking")
+            tracker.stop_all_active()
+    return True
+
+
+# =============================================================================
+# Registration
 # =============================================================================
 
 if __name__ == "__main__":
-    # Make sure tracker exists from the start
     get_tracker()
 
-    # Background monitor
     plugins.RegisterMessagePlugin(
         PLUGIN_ID_MSG,
         "Render Time Tracker Monitor",
@@ -493,14 +763,14 @@ if __name__ == "__main__":
         RenderTimerMsg(),
     )
 
-    # Menu command
     plugins.RegisterCommandPlugin(
         PLUGIN_ID_CMD,
         "Render Time Tracker",
         0,
-        None,   # icon bitmap (None = no icon)
+        None,
         "Track render queue job times and export reports",
         RenderTimeTrackerCmd(),
     )
 
     _log("Plugin loaded - Extensions > Render Time Tracker")
+    _log("Logs: {}".format(get_log().log_dir))
